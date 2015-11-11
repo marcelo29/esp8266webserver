@@ -1,0 +1,9 @@
+#ifndef MYWIFI_H
+#define MYWIFI_H
+
+#define WIFI_SSID "MySSID"
+#define WIFI_PASS "MyPassPhrase"
+
+#endif
+
+

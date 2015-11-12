@@ -67,7 +67,7 @@ public:
 		return serial_write(handle, str.c_str(), str.size());
 	}
 
-	void esp_send_command(std::string str)
+	void send_command(std::string str)
 	{
 		str += "\r\n";
 		serial_write(handle, str.c_str(), str.size());
@@ -85,7 +85,7 @@ public:
 	};
 
 
-	void esp_recv_response(ReceiveMode mode, std::vector<std::string> *lines, unsigned int timeout_ms = 0)
+	void recv_response(ReceiveMode mode, std::vector<std::string> *lines, unsigned int timeout_ms = 0)
 	{
 		if (timeout_ms == 0) {
 			timeout_ms = DEFAULT_TIMEOUT;
@@ -144,20 +144,84 @@ public:
 		}
 	}
 
-	bool is_http_connected(std::vector<std::string> const *lines, unsigned int *id)
+	bool http_accept(unsigned int *id, std::vector<char> *out)
 	{
-		if (lines->size() > 2) {
-			if (sscanf(lines->front().c_str(), "%u,CONNECT", id) == 1) {
-				return true;
+		out->clear();
+		std::vector<char> vec;
+		char tmp[1024];
+		bool connected = false;
+		unsigned int connected_id = 0;
+		bool cr = false;
+		int offset = 0;
+		int length = 0;
+		vec.reserve(1024);
+		unsigned int starttick = get_tick_count();
+		while (1) {
+			if (offset >= length) {
+				length = serial_read(handle, tmp, sizeof(tmp), 3);
+				if (length < 0 || length > sizeof(tmp)) break;
+				if (length == 0) continue;
+				offset = 0;
+			}
+			if (connected) {
+				if (vec.size() > 5 && memcmp(&vec[0], "+IPD,", 5) == 0) {
+					for (size_t i = 5; i < vec.size(); i++) {
+						if (vec[i] == ':') {
+							char const *p = &vec[0];
+							std::string s(p + 5, p + i);
+							unsigned int len = 0;
+							if (sscanf(s.c_str(), "%u,%u", id, &len) == 2 && *id == connected_id) {
+								if (len > 100000) len = 0;
+								out->resize(len);
+								if (len > 0) {
+									size_t pos = 0;
+									if (offset < length) {
+										pos = length - offset;
+										if (pos > len) pos = len;
+										memcpy(&out->at(0), tmp + offset, pos);
+									}
+									while (pos < len) {
+										int n = serial_read(handle, &out->at(pos), len - pos, 100);
+										if (n < 1) break;
+										pos += n;
+									}
+								}
+								return true;
+							}
+							connected = false;
+						}
+					}
+				}
+			}
+			int c = tmp[offset] & 0xff;
+			offset++;
+			if (c == 0x0d) {
+				cr = true;
+			} else {
+				if (cr && c == 0x0a) {
+					std::string s;
+					if (!vec.empty()) {
+						char const *p = &vec[0];
+						int n = vec.size();
+						while (n > 0 && isspace(vec[n - 1] & 0xff)) n--;
+						s.assign(p, p + n);
+					}
+					if (sscanf(s.c_str(), "%u,CONNECT", id) == 1) {
+						connected = true;
+						connected_id = *id;
+					} else if (sscanf(s.c_str(), "%u,CLOSED", id) == 1) {
+						break;
+					} else if (sscanf(s.c_str(), "%u,CONNECT FAIL", id) == 1) {
+						break;
+					}
+					vec.clear();
+				} else {
+					vec.push_back(c);
+				}
+				cr = false;
 			}
 		}
 		return false;
-	}
-
-	bool http_accept(std::vector<std::string> *lines, unsigned int *id)
-	{
-		esp_recv_response(ReceiveMode::HTTP, lines);
-		return is_http_connected(lines, id);
 	}
 
 	bool containsOK(std::vector<std::string> const *lines)
@@ -170,18 +234,18 @@ public:
 		return false;
 	}
 
-	bool esp_run_command_(std::string const &command, std::vector<std::string> *lines, int timeout_ms = 0)
+	bool command_(std::string const &command, std::vector<std::string> *lines, int timeout_ms = 0)
 	{
 		lines->clear();
-		if (!command.empty()) esp_send_command(command);
-		esp_recv_response(ReceiveMode::AT, lines, timeout_ms);
+		if (!command.empty()) send_command(command);
+		recv_response(ReceiveMode::AT, lines, timeout_ms);
 		return containsOK(lines);
 	}
 
-	bool esp_run_command(std::string const &command, std::vector<std::string> *lines, int retry = 3, int timeout_ms = 0)
+	bool run_command(std::string const &command, std::vector<std::string> *lines, int retry = 3, int timeout_ms = 0)
 	{
 		while (retry > 0) {
-			if (esp_run_command_(command, lines, timeout_ms)) {
+			if (command_(command, lines, timeout_ms)) {
 				return true;
 			}
 			serial_flush_input(handle, 100);
@@ -190,10 +254,10 @@ public:
 		return false;
 	}
 
-	bool esp_run_command(std::string const &command)
+	bool run_command(std::string const &command)
 	{
 		std::vector<std::string> lines;
-		if (esp_run_command(command, &lines, 3)) {
+		if (run_command(command, &lines, 3)) {
 			return true;
 		}
 		return false;
@@ -222,7 +286,7 @@ public:
 		return std::string(l, r);
 	}
 
-	bool lookup(std::vector<std::string> *lines, std::string const &key, std::string *out, char sep = ':')
+	static bool lookup(std::vector<std::string> const *lines, std::string const &key, std::string *out, char sep = ':')
 	{
 		for (std::string const &line : *lines) {
 			char const *begin = line.c_str();
@@ -247,13 +311,13 @@ public:
 		return false;
 	}
 
-	bool esp_connect(std::string const &ssid, std::string const &pw)
+	bool connect(std::string const &ssid, std::string const &pw)
 	{
 		std::string cmd = "AT+CWJAP=\"" + ssid + "\",\"" + pw + "\"";
 		std::vector<std::string> alllines;
 		for (int i = 0; i < 600; i++) {
 			std::vector<std::string> lines;
-			bool ok = esp_run_command_(cmd, &lines, 100);
+			bool ok = command_(cmd, &lines, 100);
 			alllines.insert(alllines.begin(), lines.begin(), lines.end());
 			if (ok) return true;
 			cmd.clear();
@@ -261,11 +325,11 @@ public:
 		return false;
 	}
 
-	std::string esp_get_ip_address()
+	std::string get_ip_address()
 	{
 		std::string ipaddr;
 		std::vector<std::string> lines;
-		esp_run_command("AT+CIFSR", &lines);
+		run_command("AT+CIFSR", &lines);
 		lookup(&lines, "+CIFSR:STAIP", &ipaddr, ',');
 		ipaddr = trim_quot(ipaddr);
 		return ipaddr;
@@ -287,11 +351,11 @@ public:
 		return tmp;
 	}
 
-	bool esp_get_mac_address_(std::string const &cmd, std::string const &key, mac_address_t *out)
+	bool get_mac_address_(std::string const &cmd, std::string const &key, mac_address_t *out)
 	{
 		*out = mac_address_t();
 		std::vector<std::string> lines;
-		if (esp_run_command(cmd, &lines)) {
+		if (run_command(cmd, &lines)) {
 			std::string t;
 			if (lookup(&lines, key, &t)) {
 				t = trim_quot(t);
@@ -310,14 +374,14 @@ public:
 		return false;
 	}
 
-	bool esp_get_st_mac_address(mac_address_t *out)
+	bool get_st_mac_address(mac_address_t *out)
 	{
-		return esp_get_mac_address_("AT+CIPSTAMAC?", "+CIPSTAMAC", out);
+		return get_mac_address_("AT+CIPSTAMAC?", "+CIPSTAMAC", out);
 	}
 
-	bool esp_get_ap_mac_address(mac_address_t *out)
+	bool get_ap_mac_address(mac_address_t *out)
 	{
-		return esp_get_mac_address_("AT+CIPAPMAC?", "+CIPAPMAC", out);
+		return get_mac_address_("AT+CIPAPMAC?", "+CIPAPMAC", out);
 	}
 };
 
@@ -332,31 +396,59 @@ std::string parse_http_request(std::string const &str)
 {
 	char const *begin = str.c_str();
 	char const *end = begin + str.size();
-	if (strncmp(begin, "+IPD,", 5) == 0) {
-		char const *ptr = begin + 5;
-		ptr = strstr(ptr, ":GET ");
-		if (ptr) {
-			char const *left = ptr + 5;
-			char const *right = left;
-			while (right < end) {
-				if (isspace(*right & 0xff)) {
-					break;
-				}
-				right++;
+	if (strncmp(begin, "GET ", 4) == 0) {
+		char const *left = begin + 4;
+		char const *right = left;
+		while (right < end) {
+			if (isspace(*right & 0xff)) {
+				break;
 			}
-			if (left < right) {
-				return std::string(left, right);
-			}
+			right++;
+		}
+		if (left < right) {
+			return std::string(left, right);
 		}
 	}
 	return std::string();
 }
 
-std::string get_content(std::string const &path)
+std::string get_body(std::string const &path)
 {
 	time_t t = time(0);
 	char *p = ctime(&t);
 	return p ? std::string(p) : std::string();
+}
+
+size_t parse_http_head(char const *begin, char const *end, std::vector<std::string> *lines)
+{
+	lines->clear();
+	char const *left = begin;
+	char const *ptr = begin;
+	while (ptr < end) {
+		int c = -1;
+		if (ptr < end) {
+			c = *ptr & 0xff;
+		}
+		if (c == '\r' || c == '\n' || c == -1) {
+			char const *right = ptr;
+			std::string s(left, right);
+			if (!s.empty()) lines->push_back(s);
+			if (c == -1) break;
+			ptr++;
+			if (c == '\r') {
+				if (ptr < end && *ptr == '\n') {
+					ptr++;
+				}
+			}
+			if (s.empty()) {
+				break;
+			}
+			left = ptr;
+		} else {
+			ptr++;
+		}
+	}
+	return ptr - begin;
 }
 
 int main(int argc, char **argv)
@@ -367,39 +459,45 @@ int main(int argc, char **argv)
 	ESP8266 esp;
 	esp.config(COMPORT, 115200);
 	if (esp.open()) {
-		if (esp.esp_run_command("AT")) {
+		if (esp.run_command("AT")) {
 			bool ok;
-			ok = esp.esp_run_command("AT+CWMODE=1");
-			ok = esp.esp_connect(ssid, pass);
+			ok = esp.run_command("AT+CWMODE=1");
+			ok = esp.connect(ssid, pass);
 			if (ok) {
-				std::string addr = esp.esp_get_ip_address();
-				ok = esp.esp_run_command("AT+CIPMUX=1");
-				ok = esp.esp_run_command("AT+CIPSERVER=1,80");
+				std::string addr = esp.get_ip_address();
+				ok = esp.run_command("AT+CIPMUX=1");
+				ok = esp.run_command("AT+CIPSERVER=1,80");
 				if (ok) {
 					while (1) {
-						std::vector<std::string> lines;
+						std::vector<std::string> reqhead;
+						std::vector<char> reqbody;
 						unsigned int id = 0;
-						ok = esp.http_accept(&lines, &id);
-						if (ok) {
+						ok = esp.http_accept(&id, &reqbody);
+						if (ok && !reqbody.empty()) {
+							char const *p = &reqbody[0];
+							size_t offset = parse_http_head(p, p + reqbody.size(), &reqhead);
 							std::string str;
-							std::string path = parse_http_request(lines[2]);
-							if (!path.empty()) {
-								std::string headers;
-								std::string content = get_content(path);
-								headers += "HTTP/1.0 OK\r\n";
-								headers += "Content-Type: text/plain\r\n";
-								headers += "\r\n";
-								unsigned int len = headers.size() + content.size();
-								str = "AT+CIPSEND=" + to_s(id) + "," + to_s(len) + "\r\n";
-								ok = esp.esp_run_command(str, &lines, 1, 500);
-								if (ok) {
-									esp.send(headers);
-									esp.send(content);
-									esp.esp_recv_response(ESP8266::ReceiveMode::CIPSEND, &lines, 1000);
+							if (reqhead.size() > 0) {
+								std::string path = parse_http_request(reqhead[0]);
+								if (!path.empty()) {
+									std::string head;
+									std::string body = get_body(path);
+									head += "HTTP/1.0 OK\r\n";
+									head += "body-Type: text/plain\r\n";
+									head += "\r\n";
+									unsigned int len = head.size() + body.size();
+									str = "AT+CIPSEND=" + to_s(id) + "," + to_s(len) + "\r\n";
+									std::vector<std::string> lines;
+									ok = esp.run_command(str, &lines, 1, 500);
+									if (ok) {
+										esp.send(head);
+										esp.send(body);
+										esp.recv_response(ESP8266::ReceiveMode::CIPSEND, &lines, 1000);
+									}
 								}
 							}
 							str = "AT+CIPCLOSE=" + to_s(id);
-							ok = esp.esp_run_command(str);
+							ok = esp.run_command(str);
 						}
 					}
 				}
